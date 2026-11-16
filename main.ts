@@ -32,6 +32,9 @@ const RETRY_MAX_MS = 2_000;
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** True once SIGTERM or SIGINT has arrived: the process is winding down, not waiting. */
+let windingDown = false;
+
 /** The wait after `attempt` failed requests: exponential from RETRY_INITIAL_MS, capped. */
 function retryDelay(attempt: number): number {
   return Math.min(RETRY_MAX_MS, RETRY_INITIAL_MS * 2 ** Math.min(attempt, 8));
@@ -76,9 +79,30 @@ async function waitForDone(): Promise<void> {
   }
 }
 
+/**
+ * Arm the shutdown path: on SIGTERM or SIGINT, stop taking new connections, drop the ones still
+ * open, and leave with status 0. A second signal is ignored because the first one already started
+ * the wind-down; the harness kills the process if it ever stalls past this point.
+ */
+function armShutdown(server: ReturnType<typeof createApp>): void {
+  const windDown = (): void => {
+    if (windingDown) return;
+    windingDown = true;
+    process.stdout.write('[entry] termination signal received; closing the listener\n');
+    server.close(() => {
+      process.stdout.write('[entry] listener closed\n');
+      process.exit(0);
+    });
+    server.closeAllConnections?.();
+  };
+  process.once('SIGTERM', windDown);
+  process.once('SIGINT', windDown);
+}
+
 /** Bound the port, register it, then wait for the env: the whole life of the process. */
 async function main(): Promise<void> {
   const server = createApp();
+  armShutdown(server);
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
     server.listen(0, () => resolve());
@@ -88,6 +112,7 @@ async function main(): Promise<void> {
   process.stdout.write(`[entry] listening on port ${address.port}\n`);
 
   await register(address.port);
+  process.stdout.write(`[entry] serving on port ${address.port} for ${ENV_URL}\n`);
   process.stdout.write('[entry] registered; waiting for the env to say done\n');
 
   await waitForDone();
