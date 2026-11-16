@@ -16,8 +16,8 @@ node main.ts
 
 `main.ts` binds an ephemeral port, registers it with `$MAKEFUN_ENV_URL`, then
 polls `/done` until the suite finishes. `app.ts` is the server: repositories,
-issues, pull requests, labels, contents and git objects, all in memory and on
-disk under the store directory.
+issues, pull requests, labels, contents and git objects, all held in memory in
+a deterministic, content-addressed store.
 
 ---
 

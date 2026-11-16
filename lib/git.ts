@@ -9,6 +9,8 @@ export type ObjType = 'blob' | 'tree' | 'commit' | 'tag';
 export interface GitObject {
   type: ObjType;
   data: Buffer;
+  /** Content id: sha1("<type> <len>\0<data>"). Always set by storeObject/readPack. */
+  oid: string;
 }
 
 export const ZERO_OID = '0000000000000000000000000000000000000000';
@@ -26,7 +28,7 @@ export function hashObject(type: ObjType, data: Buffer): string {
 
 export function storeObject(objects: Map<string, GitObject>, type: ObjType, data: Buffer): string {
   const oid = hashObject(type, data);
-  if (!objects.has(oid)) objects.set(oid, { type, data });
+  if (!objects.has(oid)) objects.set(oid, { type, data, oid });
   return oid;
 }
 
@@ -160,7 +162,20 @@ export interface CommitInfo {
   committerTs: number;
   authorTz: string;
   committerTz: string;
+  /** The author timestamp (alias of authorTs) — the commit's time. */
+  timestamp: number;
+  authorName: string;
+  authorEmail: string;
+  committerName: string;
+  committerEmail: string;
   gpgsig?: string;
+}
+
+/** Split "Name <email>" into its parts. */
+function splitIdentity(who: string): { name: string; email: string } {
+  const m = who.match(/^(.*?) <([^<>]*)>$/);
+  if (m) return { name: m[1].trim(), email: m[2] };
+  return { name: who.trim(), email: '' };
 }
 
 export function buildCommit(c: {
@@ -214,7 +229,24 @@ export function parseCommit(data: Buffer): CommitInfo {
       } else committer = line.slice(10);
     }
   }
-  return { tree, parents, author, committer, message, authorTs, committerTs, authorTz, committerTz };
+  const authorId = splitIdentity(author);
+  const committerId = splitIdentity(committer);
+  return {
+    tree,
+    parents,
+    author,
+    committer,
+    message,
+    authorTs,
+    committerTs,
+    authorTz,
+    committerTz,
+    timestamp: authorTs,
+    authorName: authorId.name,
+    authorEmail: authorId.email,
+    committerName: committerId.name,
+    committerEmail: committerId.email,
+  };
 }
 
 export function buildTag(t: {
@@ -370,7 +402,8 @@ export function readPack(buf: Buffer, lookup?: (oid: string) => GitObject | unde
       const len = deflateLen(buf, off);
       const delta = inflateSync(buf.subarray(off, off + len));
       off += len;
-      obj = { type: base.type, data: applyDelta(base.data, delta) };
+      const data = applyDelta(base.data, delta);
+      obj = { type: base.type, data, oid: hashObject(base.type, data) };
     } else if (typeCode === 7) {
       // REF_DELTA: base by object id — an earlier pack entry, or in the repository.
       const baseOid = buf.subarray(off, off + 20).toString('hex');
@@ -380,7 +413,8 @@ export function readPack(buf: Buffer, lookup?: (oid: string) => GitObject | unde
       off += len;
       const base = byOid.get(baseOid) ?? lookup?.(baseOid);
       if (!base) throw new Error(`delta base ${baseOid} not found`);
-      obj = { type: base.type, data: applyDelta(base.data, delta) };
+      const data = applyDelta(base.data, delta);
+      obj = { type: base.type, data, oid: hashObject(base.type, data) };
     } else {
       const type = PACK_TYPES[typeCode];
       if (!type) throw new Error(`unknown pack object type ${typeCode}`);
@@ -388,43 +422,49 @@ export function readPack(buf: Buffer, lookup?: (oid: string) => GitObject | unde
       const raw = inflateSync(buf.subarray(off, off + len));
       off += len;
       if (raw.length !== size) throw new Error('pack object size mismatch');
-      obj = { type, data: raw };
+      obj = { type, data: raw, oid: hashObject(type, raw) };
     }
     objects.push(obj);
     byOffset.set(start, obj);
-    byOid.set(hashObject(obj.type, obj.data), obj);
+    byOid.set(obj.oid, obj);
   }
   return objects;
 }
 
+/** Adler-32 checksum, the trailer of every zlib stream. */
+function adler32(data: Buffer): number {
+  let a = 1;
+  let b = 0;
+  for (let i = 0; i < data.length; i++) {
+    a = (a + data[i]) % 65521;
+    b = (b + a) % 65521;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
 /**
- * Bytes consumed by the zlib stream starting at `off`. inflateSync ignores trailing bytes
- * after a complete stream and throws on a truncated one, so the stream end is the smallest
- * length that inflates: found by exponential probing, then binary search.
+ * Bytes consumed by the zlib stream starting at `off`. inflateSync ignores trailing bytes,
+ * so one inflate yields the data; the stream's Adler-32 trailer then locates its end, and a
+ * verification inflate on the candidate slice rules out a coincidental match inside the
+ * deflate data. Two inflates per object instead of ~2*log2 probes.
  */
 function deflateLen(buf: Buffer, off: number): number {
-  let probe = 1;
-  const max = buf.length - off;
-  while (probe < max) {
-    try {
-      inflateSync(buf.subarray(off, off + probe));
-      break;
-    } catch {
-      probe *= 2;
+  const data = inflateSync(buf.subarray(off));
+  const want = adler32(data);
+  let pos = off + 2;
+  const max = buf.length - 4;
+  while (pos <= max) {
+    if (buf.readUInt32BE(pos) === want) {
+      const end = pos + 4;
+      try {
+        if (inflateSync(buf.subarray(off, end)).equals(data)) return end - off;
+      } catch {
+        // A truncated stream that happens to end in the checksum bytes: keep scanning.
+      }
     }
+    pos += 1;
   }
-  let lo = Math.floor(probe / 2);
-  let hi = Math.min(probe, max);
-  while (lo + 1 < hi) {
-    const mid = (lo + hi) >> 1;
-    try {
-      inflateSync(buf.subarray(off, off + mid));
-      hi = mid;
-    } catch {
-      lo = mid;
-    }
-  }
-  return hi;
+  throw new Error('could not find zlib stream end');
 }
 
 /** Apply a git delta stream to a base buffer. */
