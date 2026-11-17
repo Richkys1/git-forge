@@ -1,22 +1,25 @@
 // The entry <-> env lifecycle, as env/src/wire.ts settles it: bind an ephemeral port, tell the env the
-// port it bound, then poll until the env says the trial is over and exit 0. Keep this file as it is:
-// the suite scores the server app.ts builds, and the lifecycle is the harness's, not the contest's.
+// port it bound, then poll until the env says the trial is over and exit 0. The forge itself is the
+// vendored static Go binary next to this file (go/forge, built by go/BUILD.md); this file only
+// spawns it, learns its port from its stdout, and drives the lifecycle.
 //
 //   1. MAKEFUN_ENV_URL names the env's origin (http://store:8080 in a trial container). Without it
 //      there is nothing to talk to, so the program exits 1 at once.
-//   2. Create the server and listen(0): the kernel picks a free port. Never bind 8080 — the env owns it.
+//   2. Spawn ./forge: it binds an ephemeral port of its own and prints
+//      "[forge] listening on port N" as its first stdout line. Never bind 8080 — the env owns it.
 //   3. POST $MAKEFUN_ENV_URL/register {"port": N}. The env records the address the request came from
 //      plus N as your base URL and dials it from then on. The first register wins; a 409 means another
 //      entry already registered, and this process keeps waiting like any other.
 //   4. GET $MAKEFUN_ENV_URL/done until the body is {"done": true}. The env answers at once ({"done":
 //      false} while the suite runs), so this is a poll, not a long-held request. A failed or slow poll
 //      is retried with a short exponential backoff; the process never exits before the env says done.
-//   5. Close the server and exit 0. The harness then stops the env, which writes the export the scorer
+//   5. Stop the forge and exit 0. The harness then stops the env, which writes the export the scorer
 //      reads.
 //
-// main.ts imports its own server and nothing else: no package, no Node built-in, no model call.
-
-import { createApp } from './app.ts';
+// main.ts imports nothing but Node built-ins: no package, no model call.
+import { spawn, type ChildProcess } from 'node:child_process';
+import { createInterface } from 'node:readline';
+import { fileURLToPath } from 'node:url';
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 if (ENV_URL === '') {
@@ -80,43 +83,89 @@ async function waitForDone(): Promise<void> {
 }
 
 /**
- * Arm the shutdown path: on SIGTERM or SIGINT, stop taking new connections, drop the ones still
- * open, and leave with status 0. A second signal is ignored because the first one already started
- * the wind-down; the harness kills the process if it ever stalls past this point.
+ * Start the forge binary and wait for its "[forge] listening on port N" line. The binary's
+ * stdout is piped so the port can be read; every line is forwarded to this process's stdout.
+ * A child that exits before announcing its port is a startup failure.
  */
-function armShutdown(server: ReturnType<typeof createApp>): void {
-  const windDown = (): void => {
-    if (windingDown) return;
-    windingDown = true;
-    process.stdout.write('[entry] termination signal received; closing the listener\n');
-    server.close(() => {
-      process.stdout.write('[entry] listener closed\n');
-      process.exit(0);
+function startForge(): Promise<{ child: ChildProcess; port: number }> {
+  const forgePath = fileURLToPath(new URL('./forge', import.meta.url));
+  const child = spawn(forgePath, [], { stdio: ['ignore', 'pipe', 'inherit'] });
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const lines = createInterface({ input: child.stdout! });
+    lines.on('line', (line) => {
+      process.stdout.write(`${line}\n`);
+      if (settled) return;
+      const match = /\[forge\] listening on port (\d+)/.exec(line);
+      if (match) {
+        settled = true;
+        resolve({ child, port: Number(match[1]) });
+      }
     });
-    server.closeAllConnections?.();
-  };
-  process.once('SIGTERM', windDown);
-  process.once('SIGINT', windDown);
+    child.once('error', (err) => {
+      if (!settled) {
+        settled = true;
+        reject(new Error(`could not start the forge binary: ${err.message}`));
+      }
+    });
+    child.once('exit', (code) => {
+      if (!settled) {
+        settled = true;
+        reject(new Error(`the forge binary exited before listening (code ${code})`));
+      }
+    });
+  });
 }
 
-/** Bound the port, register it, then wait for the env: the whole life of the process. */
-async function main(): Promise<void> {
-  const server = createApp();
-  armShutdown(server);
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, () => resolve());
+/** Stop the forge child (SIGTERM, then SIGKILL if it lingers) and wait for it to leave. */
+async function stopForge(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  await new Promise<void>((resolve) => {
+    const done = (): void => resolve();
+    child.once('exit', done);
+    child.kill('SIGTERM');
+    setTimeout(() => {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    }, 2_000);
+    // Never hang the shutdown on a stubborn child.
+    setTimeout(done, 5_000);
   });
-  const address = server.address();
-  if (address === null || typeof address === 'string') throw new Error('the server did not bind an ephemeral TCP port');
-  process.stdout.write(`[entry] listening on port ${address.port}\n`);
+}
 
-  await register(address.port);
-  process.stdout.write(`[entry] serving on port ${address.port} for ${ENV_URL}\n`);
+/** Spawn the forge, register its port, then wait for the env: the whole life of the process. */
+async function main(): Promise<void> {
+  const { child, port } = await startForge();
+  process.stdout.write(`[entry] forge listening on port ${port}\n`);
+
+  const windDown = async (): Promise<void> => {
+    if (windingDown) return;
+    windingDown = true;
+    process.stdout.write('[entry] termination signal received; stopping the forge\n');
+    await stopForge(child);
+    process.stdout.write('[entry] forge stopped\n');
+    process.exit(0);
+  };
+  process.once('SIGTERM', () => void windDown());
+  process.once('SIGINT', () => void windDown());
+  child.once('exit', (code) => {
+    if (windingDown) return;
+    // The harness stops the entry by signalling the whole process group;
+    // the child may die a tick before main.ts sees its own signal. Give
+    // the signal handler a moment to take over before treating this as a
+    // real crash, so a clean shutdown doesn't look like a failure.
+    setTimeout(() => {
+      if (windingDown) return;
+      process.stderr.write(`[entry] the forge exited unexpectedly (code ${code})\n`);
+      process.exit(1);
+    }, 1000).unref();
+  });
+
+  await register(port);
+  process.stdout.write(`[entry] serving on port ${port} for ${ENV_URL}\n`);
   process.stdout.write('[entry] registered; waiting for the env to say done\n');
 
   await waitForDone();
-  server.close();
+  await stopForge(child);
   process.stdout.write('[entry] done\n');
 }
 
