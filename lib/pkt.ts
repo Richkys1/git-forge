@@ -4,14 +4,15 @@
 
 export const MAX_PKT = 65520;
 
-/** Encode one payload as a pkt-line. */
+/** Encode one payload as a pkt-line: one allocation (header + body in a single buffer). */
 export function pkt(payload: string | Buffer): Buffer {
   const body = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
   const len = body.length + 4;
   if (len > MAX_PKT) throw new Error(`pkt-line too large: ${len}`);
-  const head = Buffer.alloc(4);
-  head.write(len.toString(16).padStart(4, '0'), 'ascii');
-  return Buffer.concat([head, body]);
+  const out = Buffer.alloc(len);
+  out.write(len.toString(16).padStart(4, '0'), 0, 'ascii');
+  body.copy(out, 4);
+  return out;
 }
 
 /** A flush packet. */
@@ -34,6 +35,28 @@ export function sideband(band: 1 | 2 | 3, data: Buffer): Buffer[] {
   return out;
 }
 
+/** Value of one hex digit, or -1 when the byte is not a hex digit. */
+function hexNibble(byte: number): number {
+  if (byte >= 48 && byte <= 57) return byte - 48; // 0-9
+  if (byte >= 97 && byte <= 102) return byte - 97 + 10; // a-f
+  if (byte >= 65 && byte <= 70) return byte - 65 + 10; // A-F
+  return -1;
+}
+
+/**
+ * Read a 4-hex-digit pkt-line length at `offset`, or -1 when those bytes are not
+ * four hex digits. Replaces a per-frame toString + regex + parseInt with four
+ * byte reads; the frame parsers below call it on every pkt-line.
+ */
+function pktLineLength(buf: Buffer, offset: number): number {
+  const a = hexNibble(buf[offset]);
+  const b = hexNibble(buf[offset + 1]);
+  const c = hexNibble(buf[offset + 2]);
+  const d = hexNibble(buf[offset + 3]);
+  if (a < 0 || b < 0 || c < 0 || d < 0) return -1;
+  return (a << 12) | (b << 8) | (c << 4) | d;
+}
+
 /** Parse a byte stream into pkt-line frames. Each frame: {type:'data', data} | {type:'flush'|'delim'|'respEnd'}. */
 export interface PktFrame {
   type: 'data' | 'flush' | 'delim' | 'respEnd';
@@ -44,9 +67,8 @@ export function parsePktLines(buf: Buffer): PktFrame[] {
   const frames: PktFrame[] = [];
   let offset = 0;
   while (offset + 4 <= buf.length) {
-    const lenHex = buf.toString('ascii', offset, offset + 4);
-    if (!/^[0-9a-fA-F]{4}$/.test(lenHex)) break;
-    const len = parseInt(lenHex, 16);
+    const len = pktLineLength(buf, offset);
+    if (len < 0) break;
     if (len === 0) {
       frames.push({ type: 'flush', data: Buffer.alloc(0) });
       offset += 4;
@@ -74,9 +96,8 @@ export function splitFramesAndRest(buf: Buffer): { frames: PktFrame[]; restOffse
   const frames: PktFrame[] = [];
   let offset = 0;
   while (offset + 4 <= buf.length) {
-    const lenHex = buf.toString('ascii', offset, offset + 4);
-    if (!/^[0-9a-fA-F]{4}$/.test(lenHex)) break;
-    const len = parseInt(lenHex, 16);
+    const len = pktLineLength(buf, offset);
+    if (len < 0) break;
     if (len === 0) {
       frames.push({ type: 'flush', data: Buffer.alloc(0) });
       offset += 4;

@@ -18,6 +18,22 @@ import { listRefs, type Repo, type Store } from './store.ts';
 
 const AGENT = 'forge/1.0';
 
+/**
+ * The v2 upload-pack advertisement, built once at module load: it never depends on
+ * the repository (the same six pkt-lines for every request), so there is no reason
+ * to allocate six buffers and concatenate them on every info/refs call. The buffer
+ * is never mutated after construction (sendBuffer only reads it), so sharing one
+ * instance across responses is safe.
+ */
+const V2_UPLOAD_ADVERTISEMENT = Buffer.concat([
+  pkt('version 2\n'),
+  pkt(`agent=${AGENT}\n`),
+  pkt('ls-refs=unborn\n'),
+  pkt('fetch=shallow wait-for-done filter\n'),
+  pkt('object-format=sha1\n'),
+  FLUSH,
+]);
+
 export interface GitResponse {
   status: number;
   contentType: string;
@@ -86,15 +102,7 @@ export function handleInfoRefs(
   if (!repo) return notFound();
   const v2 = gitProtocol === 'version=2';
   if (service === 'git-upload-pack' && v2) {
-    const parts: Buffer[] = [
-      pkt('version 2\n'),
-      pkt(`agent=${AGENT}\n`),
-      pkt('ls-refs=unborn\n'),
-      pkt('fetch=shallow wait-for-done filter\n'),
-      pkt('object-format=sha1\n'),
-      FLUSH,
-    ];
-    return ok('application/x-git-upload-pack-advertisement', Buffer.concat(parts));
+    return ok('application/x-git-upload-pack-advertisement', V2_UPLOAD_ADVERTISEMENT);
   }
   if (service === 'git-upload-pack') {
     const parts: Buffer[] = [pkt('# service=git-upload-pack\n'), FLUSH, ...v0RefLines(repo, V0_UPLOAD_CAPS), FLUSH];

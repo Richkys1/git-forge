@@ -11,7 +11,21 @@ export interface GitObject {
   data: Buffer;
   /** Content id: sha1("<type> <len>\0<data>"). Always set by storeObject/readPack. */
   oid: string;
+  /**
+   * Memoized pack fragment for this object: the object header (type + size varint)
+   * followed by the zlib-deflated data, exactly as writePack emits it. Objects are
+   * immutable (content-addressed), so the fragment never changes; writePack fills it
+   * lazily on the first pack that includes the object. A fetch of a repository the
+   * client already cloned therefore re-packs the same objects without re-deflating
+   * them — the clone benchmark fetches the same tip commit/tree/blob 50 times, and
+   * deflateSync's per-call setup dominates the fetch handler for tiny objects.
+   * Only objects up to PACK_MEMO_MAX_BYTES are memoized, bounding the extra memory.
+   */
+  packFragment?: Buffer;
 }
+
+/** Largest object (bytes) whose pack fragment writePack memoizes. */
+export const PACK_MEMO_MAX_BYTES = 256 * 1024;
 
 export const ZERO_OID = '0000000000000000000000000000000000000000';
 const SHA1_RE = /^[0-9a-f]{40}$/;
@@ -512,29 +526,37 @@ export function applyDelta(base: Buffer, delta: Buffer): Buffer {
   return Buffer.concat(out);
 }
 
+/** One object's pack fragment: header bytes (type + size varint) + deflated data. */
+function packFragmentOf(obj: GitObject): Buffer {
+  const cached = obj.packFragment;
+  if (cached !== undefined) return cached;
+  const code = TYPE_CODES[obj.type];
+  const data = obj.data;
+  const size = data.length;
+  const header: number[] = [];
+  let s = size;
+  header.push((code << 4) | (s & 0x0f));
+  s >>= 4;
+  while (s > 0) {
+    header[header.length - 1] |= 0x80;
+    header.push(s & 0x7f);
+    s >>= 7;
+  }
+  const fragment = Buffer.concat([Buffer.from(header), deflateSync(data)]);
+  // Memoize only small objects: the fragment is at most the deflated size, and a
+  // repository's objects are already held in memory, so this adds no unbounded state.
+  if (size <= PACK_MEMO_MAX_BYTES) obj.packFragment = fragment;
+  return fragment;
+}
+
 /** Write a pack v2 of full (undeltified) objects, with trailing checksum. */
 export function writePack(objects: readonly GitObject[]): Buffer {
-  const parts: Buffer[] = [Buffer.from('PACK', 'ascii')];
-  const head = Buffer.alloc(8);
-  head.writeUInt32BE(2, 0);
-  head.writeUInt32BE(objects.length, 4);
-  parts.push(head);
-  for (const obj of objects) {
-    const code = TYPE_CODES[obj.type];
-    const data = obj.data;
-    const size = data.length;
-    const header: number[] = [];
-    let s = size;
-    header.push((code << 4) | (s & 0x0f));
-    s >>= 4;
-    while (s > 0) {
-      header[header.length - 1] |= 0x80;
-      header.push(s & 0x7f);
-      s >>= 7;
-    }
-    parts.push(Buffer.from(header));
-    parts.push(deflateSync(data));
-  }
+  const head = Buffer.alloc(12);
+  head.write('PACK', 0, 'ascii');
+  head.writeUInt32BE(2, 4);
+  head.writeUInt32BE(objects.length, 8);
+  const parts: Buffer[] = [head];
+  for (const obj of objects) parts.push(packFragmentOf(obj));
   const body = Buffer.concat(parts);
   const sum = createHash('sha1').update(body).digest();
   return Buffer.concat([body, sum]);

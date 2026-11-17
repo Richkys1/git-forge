@@ -28,12 +28,22 @@ function expectedToken(): string | null {
 
 function authorized(req: IncomingMessage): boolean {
   const header = req.headers.authorization ?? '';
-  const match = /^Bearer\s+(.+)$/.exec(header);
-  if (!match) return false;
-  const presented = match[1].trim();
+  // Same acceptance as /^Bearer\s+(.+)$/ without the regex: "Bearer", then at least
+  // one space/tab, then a non-empty token.
+  if (!header.startsWith('Bearer')) return false;
+  const rest = header.slice('Bearer'.length);
+  if (rest === '' || (rest[0] !== ' ' && rest[0] !== '\t')) return false;
+  const presented = rest.trim();
   if (presented === '') return false;
   const expected = expectedToken();
   return expected === null || presented === expected;
+}
+
+/** Whether the request will carry a body: a non-zero Content-Length or chunked encoding. */
+function hasBody(req: IncomingMessage): boolean {
+  const len = req.headers['content-length'];
+  if (len !== undefined) return len !== '0';
+  return req.headers['transfer-encoding'] !== undefined;
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
@@ -75,12 +85,51 @@ function segmentsOf(pathname: string): string[] {
     .split('/')
     .filter((s) => s !== '')
     .map((s) => {
+      // Most segments carry no escapes; decoding is only needed when one does.
+      if (!s.includes('%')) return s;
       try {
         return decodeURIComponent(s);
       } catch {
         return s;
       }
     });
+}
+
+/**
+ * Split a request-target into pathname + raw query without building a URL object.
+ * `new URL` allocates and parses the whole URL (scheme, host, port, path, query,
+ * fragment) on every request; the entry only ever needs the path and the query,
+ * and the request-target is origin-form (`/path?query`) in practice. Absolute-form
+ * targets (a proxy-style `http://host/path`) are reduced to their path first.
+ */
+function splitRequestTarget(raw: string): { pathname: string; query: string } {
+  let target = raw;
+  if (/^https?:\/\//i.test(target)) {
+    const slash = target.indexOf('/', target.indexOf('://') + 3);
+    target = slash === -1 ? '/' : target.slice(slash);
+  }
+  const hash = target.indexOf('#');
+  if (hash !== -1) target = target.slice(0, hash);
+  const q = target.indexOf('?');
+  if (q === -1) return { pathname: target, query: '' };
+  return { pathname: target.slice(0, q), query: target.slice(q + 1) };
+}
+
+/** The first value of one query parameter, without building a URLSearchParams. */
+function queryParam(query: string, name: string): string | null {
+  if (query === '') return null;
+  for (const part of query.split('&')) {
+    const eq = part.indexOf('=');
+    const key = eq === -1 ? part : part.slice(0, eq);
+    if (key !== name) continue;
+    const raw = eq === -1 ? '' : part.slice(eq + 1);
+    try {
+      return decodeURIComponent(raw.replace(/\+/g, ' '));
+    } catch {
+      return raw;
+    }
+  }
+  return null;
 }
 
 /** Try to pull a JSON-RPC id out of a malformed body, for the MCP parse-error reply. */
@@ -112,14 +161,7 @@ export function createApp(): Server {
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const method = req.method ?? 'GET';
-  let url: URL;
-  try {
-    url = new URL(req.url ?? '/', 'http://entry');
-  } catch {
-    sendJson(res, 400, { message: 'bad request url' });
-    return;
-  }
-  const pathname = url.pathname;
+  const { pathname, query } = splitRequestTarget(req.url ?? '/');
   const segments = segmentsOf(pathname);
 
   // The env's boot check calls this twice: 200 {"ok":true}. No auth.
@@ -134,7 +176,9 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return;
   }
 
-  const rawBody = await readBody(req);
+  // GETs (and body-less DELETEs) never carry a body: resolving immediately skips
+  // readBody's event-listener setup and the extra tick waiting for 'end'.
+  const rawBody = hasBody(req) ? await readBody(req) : Buffer.alloc(0);
   const host = req.headers.host ?? 'localhost';
 
   // REST v3 under /api/v3.
@@ -152,7 +196,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     const result = handleRest(store, {
       method,
       segments: apiSegments,
-      query: url.searchParams,
+      query: new URLSearchParams(query),
       headers: req.headers as Record<string, string>,
       body: parsed,
       rawBody: rawBody.toString('utf8'),
@@ -217,7 +261,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       return;
     }
     if (method === 'GET' && action === 'info/refs') {
-      const service = url.searchParams.get('service') ?? '';
+      const service = queryParam(query, 'service') ?? '';
       if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
         sendJson(res, 400, { message: 'service parameter is required' });
         return;
